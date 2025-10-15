@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "price-forecast"
+version = "0.1.0"
+description = "Day-ahead electricity price forecasting (DAM + ENTSO-E + Open-Meteo) with LSTM seq2seq models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Your Name", email = "you@example.com" }]
+
+# All runtime deps kept here (you asked for no-optional extras)
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "scikit-learn>=1.3",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+  "plotly>=5.22",
+  "shap>=0.45",
+  "pyarrow>=14.0",
+  "requests>=2.31",
+  "openpyxl>=3.1",
+  "entsoe-py>=0.6",
+  "tensorflow>=2.15",         # if you use the TF models in this repo
+  "ipykernel>=6.29",          # convenient for notebooks/VS Code
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["price_forecast*"]

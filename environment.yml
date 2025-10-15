@@ -1,0 +1,28 @@
+name: price-forecast
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  # numeric stack (OpenBLAS to avoid MKL megadownloads)
+  - blas=*=openblas
+  - numpy>=1.24
+  - pandas>=2.0
+  - scikit-learn>=1.3
+  # plotting without Qt
+  - matplotlib-base>=3.8
+  - seaborn>=0.13
+  - plotly>=5.22
+  # other libs
+  - shap>=0.45
+  - pyarrow>=14
+  - requests>=2.31
+  - openpyxl>=3.1
+  # jupyter
+  - ipykernel>=6.29
+  - jupyterlab>=4
+  - nb_conda_kernels
+  - pip:
+      - entsoe-py>=0.6
+      - tensorflow>=2.15    # CPU wheel from pip; OK on Windows
+      - -e .

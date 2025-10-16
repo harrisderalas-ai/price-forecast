@@ -174,7 +174,8 @@ class DatasetBuilder:
                 f"Expected price column '{self.naming.dam_price}' not found. "
                 "Ensure DAMAdapter naming matches the dataset."
             )
-        out[prev_day_col] = out[self.naming.dam_price].shift(hours_back)
+        prev_day = out[self.naming.dam_price].shift(hours_back)
+        out.insert(2, prev_day_col, prev_day)
         out.dropna(subset=[prev_day_col], inplace=True)
         return out
 
@@ -216,17 +217,19 @@ class DatasetBuilder:
 
         # 2) Sources
         dam_local, dam_utc = self._build_dam()
+        print("Finished building DAM data.")
         entsoe_local, entsoe_utc = self._build_entsoe(start_utc, end_utc)
+        print("Finished building ENTSO-E data.")
         wx_local, wx_utc = self._build_weather(start_date, end_date)
-
+        print("Finished building Weather data.")
         # 3) Merge on UTC
         merged_utc = self._merge_all_utc(dam_utc, entsoe_utc, wx_utc)
-
+        print("Finished merging all data on UTC axis.")
         # 4) Back to local
         merged_local = self._back_to_local(merged_utc)
-
+        print("Converted merged data back to local timezone.")
         # 5) Feature engineering
         if add_prev_day:
             merged_local = self._add_previous_day_feature(merged_local, hours_back=24)
-
+            print("Added previous-day DAM price feature.")
         return merged_local

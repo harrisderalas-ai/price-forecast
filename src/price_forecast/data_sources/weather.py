@@ -11,7 +11,7 @@ import requests
 import pandas as pd
 from ..config import TimezoneConfig, Naming
 from ..utils.time_axis import TimeAxisService
-
+from ..utils.interpolate import interpolate_local, interpolate_utc
 
 # ============================================================================
 # Weather (Open-Meteo) Adapter

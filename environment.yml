@@ -6,7 +6,7 @@ dependencies:
   - pip
   # numeric stack (OpenBLAS to avoid MKL megadownloads)
   - blas=*=openblas
-  - numpy>=1.24
+  - numpy>=1.24,<2.0
   - pandas>=2.0
   - scikit-learn>=1.3
   # plotting without Qt

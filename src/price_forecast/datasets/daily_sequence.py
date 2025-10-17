@@ -1,12 +1,9 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-from sklearn.preprocessing import StandardScaler
+from typing import Dict, List, Tuple, Optional, Sequence
 from ..config import DatasetCfg
-
-
+from ..utils.relative import RelativeDeltaTransformer
 
 
 class DailySequenceDataset:
@@ -18,17 +15,35 @@ class DailySequenceDataset:
     Step:      exactly one day (00:00→23:00) per sample.
 
     Assumptions: dataframe is already hourly, contiguous, unique timestamps, and NaN-free.
+
+    New (opt-in, backwards compatible):
+    - target_as_relative:   predict relative deltas for the target instead of absolute values
+    - relative_feature_cols: turn selected feature columns into relative deltas (e.g., ["previous_day_dam"])
     """
 
     # ---------- lifecycle ----------
-    def __init__(self, df: pd.DataFrame, cfg: DatasetCfg):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        cfg: DatasetCfg,
+        *,
+        target_as_relative: bool = False,
+        relative_feature_cols: Optional[Sequence[str]] = None,
+        epsilon: float = 1e-6,
+        fill_value: float = 0.0,
+    ):
         self.cfg = cfg
         self.df = df.copy().sort_values(cfg.datetime_col).reset_index(drop=True)
+
+        # Relative-delta setup
+        self.target_as_relative = target_as_relative
+        self.relative_feature_cols = list(relative_feature_cols or [])
+        self.rel_t = RelativeDeltaTransformer(epsilon=epsilon, fill_value=fill_value,mode='diff')
 
         # Sanity checks (no mutation)
         self._assert_hourly_unique(self.df[cfg.datetime_col])
 
-        # Calendar features (deterministic)
+        # Calendar features (deterministic; same as old impl)
         fdf = self._add_calendar_features(self.df, cfg.datetime_col)
 
         # Choose numeric feature columns (exclude target); enforce main series order
@@ -36,9 +51,28 @@ class DailySequenceDataset:
             fdf, cfg.target_col, cfg.main_series, cfg.put_main_first
         )
 
+        # Optionally convert selected *features* to relative differences
+        if self.relative_feature_cols:
+            # only transform those that are actually in feature_cols
+            rel_cols = [c for c in self.relative_feature_cols if c in self.feature_cols]
+            if rel_cols:
+                # transform each column independently to relative deltas
+                for c in rel_cols:
+                    fdf[c] = self.rel_t.fit_transform(fdf[c].to_numpy())
+
         # Keep datetime for tidy DataFrame exports
         self.X_frame = fdf[[cfg.datetime_col] + self.feature_cols]
-        self.y_series = self.df[cfg.target_col]
+        y_series_abs = self.df[cfg.target_col].copy()
+
+        # Optionally convert *target* to relative differences
+        if self.target_as_relative:
+            y_rel = self.rel_t.fit_transform(y_series_abs.to_numpy())
+            self.y_series = pd.Series(y_rel, index=y_series_abs.index, name=cfg.target_col)
+            # Keep bases per day to invert later: base for day k is the absolute value at (k*24 - 1)
+            self._y_base_days = self._compute_day_bases(y_series_abs)
+        else:
+            self.y_series = y_series_abs
+            self._y_base_days = None
 
         # Reshape to days; do not alter values or timezone
         self.X_days, self.dt_days = self._reshape_days(
@@ -55,11 +89,19 @@ class DailySequenceDataset:
         if self.X_days.shape[1] != 24 or self.y_days.shape[1] != 24:
             raise RuntimeError("Each day must have exactly 24 rows (00:00→23:00).")
 
+        # Will be filled by build()
+        self._y_train_bases: Optional[np.ndarray] = None
+        self._y_test_bases: Optional[np.ndarray] = None
+
     # ---------- public API ----------
     def build(self, return_dfs: bool = True) -> Dict[str, object]:
         """
         Assemble samples and split on the nearest whole-day boundary.
         Returns BOTH scaled and unscaled arrays (and DataFrames if requested).
+
+        Backwards-compatible with the previous class (same keys in the dict).
+        If target_as_relative=True, also returns `y_train_bases` and `y_test_bases`
+        to help invert predictions day-by-day.
         """
         X, y, Xdt, ydt = self._make_samples_same_day()
 
@@ -76,6 +118,19 @@ class DailySequenceDataset:
         # --- keep RAW (unscaled) copies ---
         X_tr_raw, X_te_raw = X_tr.copy(), X_te.copy()
         y_tr_raw, y_te_raw = y_tr.copy(), y_te.copy()
+
+        # --- per-sample bases for relative target inversion ---
+        if self.target_as_relative:
+            # base for sample d is base of the TARGET's last-day in that sample (i.e., day d)
+            # samples start at day index (N-1) .. (num_days-1)
+            N = self.cfg.n_lookback_days
+            sample_day_indices = np.arange(N - 1, N - 1 + S)
+            y_bases_all = self._y_base_days[sample_day_indices]
+            self._y_train_bases = y_bases_all[:split_idx]
+            self._y_test_bases = y_bases_all[split_idx:]
+        else:
+            self._y_train_bases = None
+            self._y_test_bases = None
 
         # --- scale on TRAIN only (if enabled) ---
         if self.cfg.scale_features:
@@ -100,11 +155,16 @@ class DailySequenceDataset:
 
             "meta": {
                 "split_idx_days": split_idx,
-                "total_days": S,
+                "total_days": self.X_days.shape[0],
                 "feature_cols": self.feature_cols,
                 "lookback_hours": self.cfg.n_lookback_days * 24,
+                "target_mode": "relative" if self.target_as_relative else "absolute",
             },
         }
+
+        if self.target_as_relative:
+            out["y_train_bases"] = self._y_train_bases
+            out["y_test_bases"]  = self._y_test_bases
 
         if return_dfs:
             # Scaled DFs
@@ -121,11 +181,62 @@ class DailySequenceDataset:
 
         return out
 
-    def inverse_transform_target(self, y_scaled: np.ndarray) -> np.ndarray:
-        """Inverse-transform y from scaler space to original units (no-op if scaling disabled)."""
-        if not self.cfg.scale_target:
-            return y_scaled
-        return self.cfg.target_scaler.inverse_transform(y_scaled.reshape(-1, 1)).reshape(y_scaled.shape)
+    def inverse_transform_target(
+        self,
+        y_scaled: np.ndarray,
+        *,
+        bases: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Convert model outputs back to absolute target units (EUR/MWh).
+
+        Pipeline
+        --------
+        1) If y was scaled: inverse-scale using `target_scaler`.
+        2) If target_as_relative is False: return (S, 24, 1).
+        3) If target_as_relative is True:
+        Reconstruct per sample, hour-by-hour, using the SAME denominator as forward:
+            denom = sign(prev) * max(|prev|, min_denominator)
+            x_t   = r_t * (denom + epsilon) + prev
+        """
+        # Normalize to (S, 24)
+        y_arr = y_scaled[..., 0] if (y_scaled.ndim == 3 and y_scaled.shape[-1] == 1) else y_scaled
+
+        # Step 1: undo scaling (if any)
+        if self.cfg.scale_target:
+            y_arr = self.cfg.target_scaler.inverse_transform(y_arr.reshape(-1, 1)).reshape(y_arr.shape)
+
+        # Absolute target case
+        if not self.target_as_relative:
+            return y_arr[..., None]
+
+        # Relative target requires bases
+        if bases is None:
+            raise ValueError(
+                "Relative target inversion requires per-sample bases. "
+                "Pass bases=out['y_train_bases'] or out['y_test_bases'] returned by build()."
+            )
+        if len(bases) != y_arr.shape[0]:
+            raise ValueError("Length of `bases` must match number of samples (S).")
+
+        # Step 2: reconstruct per sample; mirror forward denom
+        out_abs = np.empty_like(y_arr, dtype=float)
+        eps = self.rel_t.epsilon
+        min_den = getattr(self.rel_t, "min_denominator", 0.0)
+
+        for s in range(y_arr.shape[0]):
+            prev = bases[s]
+            for t in range(y_arr.shape[1]):
+                if min_den > 0.0:
+                    denom = np.sign(prev) * max(abs(prev), min_den)  # <-- mirror forward
+                else:
+                    denom = prev
+                out_abs[s, t] = (y_arr[s, t] * (denom + eps)) + prev
+                prev = out_abs[s, t]
+
+        return out_abs[..., None]
+
+
 
     # ---------- static/utility methods ----------
     @staticmethod
@@ -133,9 +244,7 @@ class DailySequenceDataset:
         s = pd.to_datetime(dt)
         if s.duplicated().any():
             raise ValueError("Timestamps must be unique.")
-        # Check 1-hour diffs except for the first row
         diffs = s.diff().iloc[1:]
-        # Allow tz-aware or naive; compare to 1 hour
         if not np.all(diffs.view("i8") == pd.Timedelta(hours=1).value):
             raise ValueError("Datetime diffs must be exactly 1 hour everywhere.")
 
@@ -171,12 +280,10 @@ class DailySequenceDataset:
           dt_days:   (num_days, 24) ndarray of datetimes (tz preserved)
         """
         n_rows = values_2d.shape[0]
-        dt_arr = pd.to_datetime(dt_like).to_numpy(copy=False)  # works for Series/Index, tz-safe
-
+        dt_arr = pd.to_datetime(dt_like).to_numpy(copy=False)
         if dt_arr.shape[0] != n_rows:
             raise ValueError("Datetime and values length mismatch.")
 
-        # Align to full days: trim the head so length is a multiple of 24 (keeps order intact)
         rem = n_rows % 24
         if rem != 0:
             values_2d = values_2d[rem:]
@@ -233,3 +340,39 @@ class DailySequenceDataset:
             index=idx,
         )
         return out[["datetime", target_col]]
+
+    # --------- helpers for relative inversion ---------
+    @staticmethod
+    def _compute_day_bases(y_abs: pd.Series) -> np.ndarray:
+        """
+        Base for day k is y_abs at index (k*24 - 1) — the hour just before that day starts.
+        For k=0, base is NaN (no prior hour).
+        Returns shape: (num_days,)
+        """
+        n = len(y_abs)
+        rem = n % 24
+        if rem != 0:
+            y_abs = y_abs.iloc[rem:].reset_index(drop=True)
+        num_days = len(y_abs) // 24
+        bases = np.full((num_days,), np.nan, dtype=float)
+        # day k starts at idx k*24; its base is idx k*24 - 1
+        for k in range(num_days):
+            idx = k * 24 - 1
+            if idx >= 0:
+                bases[k] = float(y_abs.iloc[idx])
+        return bases
+
+
+# ---------------------------------------------------------------------- #
+# Small utility: identity scaler (drop-in when scaling disabled)
+# ---------------------------------------------------------------------- #
+class _IdentityScaler:
+    def fit(self, X):
+        return self
+    def transform(self, X):
+        return np.asarray(X)
+    def fit_transform(self, X):
+        return np.asarray(X)
+    def inverse_transform(self, X):
+        return np.asarray(X)
+

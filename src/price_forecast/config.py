@@ -68,6 +68,26 @@ class WeatherConfig:
     )
 
 
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+class SafeStandardScaler(StandardScaler):
+    """
+    Like StandardScaler but clamps extremely small std during inverse_transform
+    to avoid giant multipliers when mapping back to original space.
+    """
+    def __init__(self, min_scale: float = 1e-2, **kwargs):
+        super().__init__(**kwargs)
+        self.min_scale = float(min_scale)
+
+    def inverse_transform(self, X, copy=None):
+        orig_scale = self.scale_
+        try:
+            self.scale_ = np.maximum(self.scale_, self.min_scale)
+            return super().inverse_transform(X, copy=copy)
+        finally:
+            self.scale_ = orig_scale
+
 
 
 @dataclass(frozen=True)
@@ -80,8 +100,12 @@ class DatasetCfg:
     put_main_first: bool = True
     scale_features: bool = True
     scale_target: bool = True
-    feature_scaler: StandardScaler = StandardScaler()
-    target_scaler: StandardScaler = StandardScaler()
+    feature_scaler: StandardScaler = SafeStandardScaler()
+    target_scaler: StandardScaler = SafeStandardScaler()
+    use_relative_features: bool = False
+    relative_feature_cols: Tuple[str, ...] = ("previous_day_dam",)
+    target_as_relative: bool = False
+    relative_epsilon: float = 1e-5
 
 
 

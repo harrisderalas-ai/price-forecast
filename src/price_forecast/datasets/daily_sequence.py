@@ -1,9 +1,10 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Sequence
-from ..config import DatasetCfg
-from ..utils.relative import RelativeDeltaTransformer
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+
+from ..config import DatasetCfg  # your dataclass(frozen=True) with scalers etc.
 
 
 class DailySequenceDataset:
@@ -14,231 +15,307 @@ class DailySequenceDataset:
     Target y: 24 values of the LAST day inside that window -> shape (24, 1)
     Step:      exactly one day (00:00→23:00) per sample.
 
-    Assumptions: dataframe is already hourly, contiguous, unique timestamps, and NaN-free.
+    Assumptions
+    -----------
+    - DataFrame is already hourly, contiguous, unique timestamps, and NaN-free.
+    - Upstream builder has already created the *_diff columns (e.g.:
+        - target_col + "_diff" (e.g., "dam_price_eur_mwh_diff")
+        - main_series + "_diff" (e.g., "previous_day_dam_diff")
+      If not, `keep_only_diff=True` will result in empty features.
 
-    New (opt-in, backwards compatible):
-    - target_as_relative:   predict relative deltas for the target instead of absolute values
-    - relative_feature_cols: turn selected feature columns into relative deltas (e.g., ["previous_day_dam"])
+    What changed (compared to your earlier class)
+    ---------------------------------------------
+    - No relative features are generated here.
+    - `build()` now accepts two switches:
+        * keep_only_diff: if True, drop absolute feature columns and keep only *_diff.
+        * diff_as_target: if True, y = target_diff; else y = target_abs.
+          In both cases we prevent leakage by dropping the "other" target flavor from X.
+    - A helper `inverse_transform_target(...)` reconstructs the absolute series:
+        * If diff_as_target=False: inverse-scale only (absolute output).
+        * If diff_as_target=True: inverse-scale diffs, then cumulatively add a per-sample base
+          (absolute value at the hour right before the target day starts).
+
+    Backwards compatibility
+    -----------------------
+    - Output dictionary keys match your previous pipeline (X/y arrays + optional DataFrames).
+    - Adds `y_train_bases` / `y_test_bases` only when diff_as_target=True (needed to invert).
+    - Adds `full_df` for inspection.
     """
 
     # ---------- lifecycle ----------
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        cfg: DatasetCfg,
-        *,
-        target_as_relative: bool = False,
-        relative_feature_cols: Optional[Sequence[str]] = None,
-        epsilon: float = 1e-6,
-        fill_value: float = 0.0,
-    ):
+    def __init__(self, df: pd.DataFrame, cfg: DatasetCfg):
         self.cfg = cfg
-        self.df = df.copy().sort_values(cfg.datetime_col).reset_index(drop=True)
+        # Keep a full copy for inspection; ensure deterministic ordering
+        self.full_df = df.copy().sort_values(cfg.datetime_col).reset_index(drop=True)
 
-        # Relative-delta setup
-        self.target_as_relative = target_as_relative
-        self.relative_feature_cols = list(relative_feature_cols or [])
-        self.rel_t = RelativeDeltaTransformer(epsilon=epsilon, fill_value=fill_value,mode='diff')
+        # Defensive: timestamps must be hourly & unique
+        self._assert_hourly_unique(self.full_df[cfg.datetime_col])
 
-        # Sanity checks (no mutation)
-        self._assert_hourly_unique(self.df[cfg.datetime_col])
+        # Calendar features (deterministic; stays the same as before)
+        with_cal = self._add_calendar_features(self.full_df, cfg.datetime_col)
 
-        # Calendar features (deterministic; same as old impl)
-        fdf = self._add_calendar_features(self.df, cfg.datetime_col)
-
-        # Choose numeric feature columns (exclude target); enforce main series order
-        self.feature_cols = self._choose_feature_cols(
-            fdf, cfg.target_col, cfg.main_series, cfg.put_main_first
+        # Feature selection (numeric, excluding target) and main-series ordering
+        self.feature_cols_all = self._choose_feature_cols(
+            with_cal, cfg.target_col, cfg.main_series, cfg.put_main_first
         )
 
-        # Optionally convert selected *features* to relative differences
-        if self.relative_feature_cols:
-            # only transform those that are actually in feature_cols
-            rel_cols = [c for c in self.relative_feature_cols if c in self.feature_cols]
-            if rel_cols:
-                # transform each column independently to relative deltas
-                for c in rel_cols:
-                    fdf[c] = self.rel_t.fit_transform(fdf[c].to_numpy())
-
-        # Keep datetime for tidy DataFrame exports
-        self.X_frame = fdf[[cfg.datetime_col] + self.feature_cols]
-        y_series_abs = self.df[cfg.target_col].copy()
-
-        # Optionally convert *target* to relative differences
-        if self.target_as_relative:
-            y_rel = self.rel_t.fit_transform(y_series_abs.to_numpy())
-            self.y_series = pd.Series(y_rel, index=y_series_abs.index, name=cfg.target_col)
-            # Keep bases per day to invert later: base for day k is the absolute value at (k*24 - 1)
-            self._y_base_days = self._compute_day_bases(y_series_abs)
+        # Store for later
+        if cfg.target_col+"_diff" in self.full_df.columns:
+            self._target_diff_col = f"{cfg.target_col}_diff"
         else:
-            self.y_series = y_series_abs
-            self._y_base_days = None
+            self._target_diff_col = f"{cfg.target_col}_rel" 
+        self._frame_with_features = with_cal[[cfg.datetime_col] + self.feature_cols_all]
+        self._dt_col = cfg.datetime_col
+        self._target_abs_col = cfg.target_col
+        
 
-        # Reshape to days; do not alter values or timezone
-        self.X_days, self.dt_days = self._reshape_days(
-            self.X_frame[self.feature_cols].to_numpy(),
-            self.X_frame[cfg.datetime_col],
-        )
-        self.y_days, _ = self._reshape_days(
-            self.y_series.to_numpy().reshape(-1, 1),
-            self.X_frame[cfg.datetime_col],
-        )
+        # Shapes after reshape
+        self.X_days: Optional[np.ndarray] = None
+        self.y_days: Optional[np.ndarray] = None
+        self.dt_days: Optional[np.ndarray] = None
 
-        if self.X_days.shape[0] != self.y_days.shape[0]:
-            raise RuntimeError("Mismatch between X and y day counts.")
-        if self.X_days.shape[1] != 24 or self.y_days.shape[1] != 24:
-            raise RuntimeError("Each day must have exactly 24 rows (00:00→23:00).")
-
-        # Will be filled by build()
+        # Bases for diff-mode inversion
         self._y_train_bases: Optional[np.ndarray] = None
         self._y_test_bases: Optional[np.ndarray] = None
 
     # ---------- public API ----------
-    def build(self, return_dfs: bool = True) -> Dict[str, object]:
+    def build(
+        self,
+        *,
+        keep_only_diff: bool = False,
+        diff_as_target: bool = False,
+        return_dfs: bool = True,
+    ) -> Dict[str, object]:
         """
-        Assemble samples and split on the nearest whole-day boundary.
-        Returns BOTH scaled and unscaled arrays (and DataFrames if requested).
+        Assemble samples and split by whole days; fit scalers on TRAIN only.
 
-        Backwards-compatible with the previous class (same keys in the dict).
-        If target_as_relative=True, also returns `y_train_bases` and `y_test_bases`
-        to help invert predictions day-by-day.
+        Parameters
+        ----------
+        keep_only_diff : bool, default False
+            If True, keep only feature columns that end with "_diff".
+            (Absolute feature columns are dropped.)
+        diff_as_target : bool, default False
+            If True, use the target *diff* column as y.
+            - We will DROP the absolute target column from X to avoid leakage.
+            If False, use the absolute target as y and DROP the target diff from X.
+        return_dfs : bool, default True
+            Whether to also return tidy DataFrames (scaled and raw).
+
+        Returns
+        -------
+        dict
+            {
+              "X_train", "X_test", "y_train", "y_test",
+              "X_train_raw", "X_test_raw", "y_train_raw", "y_test_raw",
+              "meta": {...},
+              # present in diff_as_target=True:
+              "y_train_bases", "y_test_bases",
+              # optional (if return_dfs=True)
+              "X_train_df", "X_test_df", "y_train_df", "y_test_df",
+              "X_train_df_raw", "X_test_df_raw", "y_train_df_raw", "y_test_df_raw",
+              # always present:
+              "full_df": <original full dataframe with calendar feats>
+            }
         """
+        cfg = self.cfg
+
+        # ---------- 1) Choose feature set per switches ----------
+        feature_cols = list(self.feature_cols_all)
+        print("Initial feature columns:", feature_cols)
+
+        # Maybe keep only *_diff columns in X
+        if keep_only_diff:
+            feature_cols = [c for c in feature_cols if c.endswith("_diff") or c.endswith("_rel")]
+
+        # Prevent target leakage in X
+        if diff_as_target:
+            print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+            # y will be target_diff → ensure absolute target not in X
+            if self._target_diff_col in feature_cols:
+                feature_cols.remove(self._target_diff_col)
+                print(f"Removed absolute target '{self._target_diff_col}' from features to avoid leakage.")
+        else:
+            print("============================================================")
+            # y will be target_abs → ensure target_diff not in X
+            if self._target_abs_col in feature_cols:
+                feature_cols.remove(self._target_abs_col)
+                print(f"Removed target diff '{self._target_abs_col}' from features to avoid leakage.")
+
+        # ---------- 2) Split X (features frame) and y (target series) ----------
+        X_frame = self._frame_with_features[[self._dt_col] + feature_cols].copy()
+
+        if diff_as_target:
+            if self._target_diff_col not in self.full_df.columns:
+                raise KeyError(
+                    f"Missing '{self._target_diff_col}' in DataFrame. "
+                    "Create target diff upstream (e.g., builder._add_diff_features)."
+                )
+            y_series = self.full_df[self._target_diff_col].copy()
+        else:
+            y_series = self.full_df[self._target_abs_col].copy()
+
+        # ---------- 3) Reshape to days (24 per day) ----------
+        X_days, dt_days = self._reshape_days(
+            X_frame[feature_cols].to_numpy(),
+            X_frame[self._dt_col],
+        )
+        y_days, _ = self._reshape_days(
+            y_series.to_numpy().reshape(-1, 1),
+            X_frame[self._dt_col],
+        )
+        if X_days.shape[0] != y_days.shape[0]:
+            raise RuntimeError("Mismatch between X and y day counts.")
+        if X_days.shape[1] != 24 or y_days.shape[1] != 24:
+            raise RuntimeError("Each day must have exactly 24 rows (00:00→23:00).")
+
+        # Keep for later
+        self.X_days, self.y_days, self.dt_days = X_days, y_days, dt_days
+
+        # ---------- 4) Assemble samples (sliding by *days*, step=1 day) ----------
         X, y, Xdt, ydt = self._make_samples_same_day()
 
+        # ---------- 5) Make tail split (whole-sample) ----------
         S = X.shape[0]
-        split_idx = int(round(S * (1 - self.cfg.test_size)))
-        split_idx = max(self.cfg.n_lookback_days, min(S - 1, split_idx))
+        split_idx = int(round(S * (1 - cfg.test_size)))
+        split_idx = max(cfg.n_lookback_days, min(S - 1, split_idx))
 
-        # --- split ---
         X_tr, X_te = X[:split_idx], X[split_idx:]
         y_tr, y_te = y[:split_idx], y[split_idx:]
         Xdt_tr, Xdt_te = Xdt[:split_idx], Xdt[split_idx:]
         ydt_tr, ydt_te = ydt[:split_idx], ydt[split_idx:]
 
-        # --- keep RAW (unscaled) copies ---
+        # ---------- 6) RAW copies (pre-scaling) ----------
         X_tr_raw, X_te_raw = X_tr.copy(), X_te.copy()
         y_tr_raw, y_te_raw = y_tr.copy(), y_te.copy()
 
-        # --- per-sample bases for relative target inversion ---
-        if self.target_as_relative:
-            # base for sample d is base of the TARGET's last-day in that sample (i.e., day d)
-            # samples start at day index (N-1) .. (num_days-1)
-            N = self.cfg.n_lookback_days
+        # ---------- 7) Per-sample bases (for diff_as_target inversion) ----------
+        self._y_train_bases, self._y_test_bases = None, None
+        if diff_as_target:
+            # Base per day = absolute target value at (k*24 - 1)
+            bases_all_days = self._compute_day_bases(self.full_df[self._target_abs_col])
+            N = cfg.n_lookback_days
             sample_day_indices = np.arange(N - 1, N - 1 + S)
-            y_bases_all = self._y_base_days[sample_day_indices]
+            y_bases_all = bases_all_days[sample_day_indices]
             self._y_train_bases = y_bases_all[:split_idx]
-            self._y_test_bases = y_bases_all[split_idx:]
-        else:
-            self._y_train_bases = None
-            self._y_test_bases = None
+            self._y_test_bases  = y_bases_all[split_idx:]
 
-        # --- scale on TRAIN only (if enabled) ---
-        if self.cfg.scale_features:
+        # ---------- 8) Fit scalers on TRAIN only, transform both splits ----------
+        if cfg.scale_features:
             F = X_tr.shape[2]
-            self.cfg.feature_scaler.fit(X_tr.reshape(-1, F))
-            X_tr = self.cfg.feature_scaler.transform(X_tr.reshape(-1, F)).reshape(X_tr.shape)
-            X_te = self.cfg.feature_scaler.transform(X_te.reshape(-1, F)).reshape(X_te.shape)
+            cfg.feature_scaler.fit(X_tr.reshape(-1, F))
+            X_tr = cfg.feature_scaler.transform(X_tr.reshape(-1, F)).reshape(X_tr.shape)
+            X_te = cfg.feature_scaler.transform(X_te.reshape(-1, F)).reshape(X_te.shape)
 
-        if self.cfg.scale_target:
-            self.cfg.target_scaler.fit(y_tr.reshape(-1, 1))
-            y_tr = self.cfg.target_scaler.transform(y_tr.reshape(-1, 1)).reshape(y_tr.shape)
-            y_te = self.cfg.target_scaler.transform(y_te.reshape(-1, 1)).reshape(y_te.shape)
+        if cfg.scale_target:
+            cfg.target_scaler.fit(y_tr.reshape(-1, 1))
+            y_tr = cfg.target_scaler.transform(y_tr.reshape(-1, 1)).reshape(y_tr.shape)
+            y_te = cfg.target_scaler.transform(y_te.reshape(-1, 1)).reshape(y_te.shape)
 
+        # ---------- 9) Package outputs ----------
         out: Dict[str, object] = {
-            # Scaled
+            # Scaled arrays
             "X_train": X_tr, "X_test": X_te,
             "y_train": y_tr, "y_test": y_te,
 
-            # Unscaled (raw)
+            # Unscaled arrays
             "X_train_raw": X_tr_raw, "X_test_raw": X_te_raw,
             "y_train_raw": y_tr_raw, "y_test_raw": y_te_raw,
 
             "meta": {
                 "split_idx_days": split_idx,
                 "total_days": self.X_days.shape[0],
-                "feature_cols": self.feature_cols,
-                "lookback_hours": self.cfg.n_lookback_days * 24,
-                "target_mode": "relative" if self.target_as_relative else "absolute",
+                "feature_cols": feature_cols,
+                "lookback_hours": cfg.n_lookback_days * 24,
+                "target_mode": "diff" if diff_as_target else "absolute",
             },
+
+            # Always give the full (inspection) DataFrame that fed the pipeline
+            "full_df": self._frame_with_features.assign(**{
+                self._target_abs_col: self.full_df[self._target_abs_col].values,
+                self._target_diff_col: self.full_df.get(self._target_diff_col, pd.Series(index=self.full_df.index, dtype=float)),
+            }),
         }
 
-        if self.target_as_relative:
+        if diff_as_target:
             out["y_train_bases"] = self._y_train_bases
             out["y_test_bases"]  = self._y_test_bases
 
         if return_dfs:
-            # Scaled DFs
-            out["X_train_df"] = self._to_long_X_df(X_tr, Xdt_tr, self.feature_cols)
-            out["X_test_df"]  = self._to_long_X_df(X_te, Xdt_te, self.feature_cols)
-            out["y_train_df"] = self._to_long_y_df(y_tr, ydt_tr, self.cfg.target_col)
-            out["y_test_df"]  = self._to_long_y_df(y_te, ydt_te, self.cfg.target_col)
+            # Scaled DFs (tidy long)
+            out["X_train_df"] = self._to_long_X_df(X_tr, Xdt_tr, feature_cols)
+            out["X_test_df"]  = self._to_long_X_df(X_te, Xdt_te, feature_cols)
+            out["y_train_df"] = self._to_long_y_df(y_tr, ydt_tr, self._target_diff_col if diff_as_target else self._target_abs_col)
+            out["y_test_df"]  = self._to_long_y_df(y_te, ydt_te, self._target_diff_col if diff_as_target else self._target_abs_col)
 
-            # Raw DFs
-            out["X_train_df_raw"] = self._to_long_X_df(X_tr_raw, Xdt_tr, self.feature_cols)
-            out["X_test_df_raw"]  = self._to_long_X_df(X_te_raw, Xdt_te, self.feature_cols)
-            out["y_train_df_raw"] = self._to_long_y_df(y_tr_raw, ydt_tr, self.cfg.target_col)
-            out["y_test_df_raw"]  = self._to_long_y_df(y_te_raw, ydt_te, self.cfg.target_col)
+            # Raw DFs (tidy long)
+            out["X_train_df_raw"] = self._to_long_X_df(X_tr_raw, Xdt_tr, feature_cols)
+            out["X_test_df_raw"]  = self._to_long_X_df(X_te_raw, Xdt_te, feature_cols)
+            out["y_train_df_raw"] = self._to_long_y_df(y_tr_raw, ydt_tr, self._target_diff_col if diff_as_target else self._target_abs_col)
+            out["y_test_df_raw"]  = self._to_long_y_df(y_te_raw, ydt_te, self._target_diff_col if diff_as_target else self._target_abs_col)
 
         return out
 
+    # ------------------------------------------------------------------ #
+    # Inversion helper
+    # ------------------------------------------------------------------ #
     def inverse_transform_target(
         self,
         y_scaled: np.ndarray,
         *,
+        diff_as_target: bool,
         bases: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Convert model outputs back to absolute target units (EUR/MWh).
 
-        Pipeline
-        --------
-        1) If y was scaled: inverse-scale using `target_scaler`.
-        2) If target_as_relative is False: return (S, 24, 1).
-        3) If target_as_relative is True:
-        Reconstruct per sample, hour-by-hour, using the SAME denominator as forward:
-            denom = sign(prev) * max(|prev|, min_denominator)
-            x_t   = r_t * (denom + epsilon) + prev
+        Parameters
+        ----------
+        y_scaled : np.ndarray
+            Predicted sequences in model output space; shape (S, 24, 1) or (S, 24).
+        diff_as_target : bool
+            Must match what you used in `build()`.
+            - True  → y is (scaled) diffs; we inverse-scale then cumulative-sum with `bases`.
+            - False → y is (scaled) absolute; we inverse-scale only.
+        bases : np.ndarray, optional (required if diff_as_target=True)
+            Shape (S,). Per-sample base = absolute value at the hour just
+            before the target day starts. Use `out["y_train_bases"]` / `out["y_test_bases"]`.
+
+        Returns
+        -------
+        np.ndarray
+            Absolute predictions with shape (S, 24, 1).
         """
-        # Normalize to (S, 24)
-        y_arr = y_scaled[..., 0] if (y_scaled.ndim == 3 and y_scaled.shape[-1] == 1) else y_scaled
+        arr = y_scaled[..., 0] if (y_scaled.ndim == 3 and y_scaled.shape[-1] == 1) else y_scaled
 
-        # Step 1: undo scaling (if any)
+        # Undo scaling
         if self.cfg.scale_target:
-            y_arr = self.cfg.target_scaler.inverse_transform(y_arr.reshape(-1, 1)).reshape(y_arr.shape)
+            arr = self.cfg.target_scaler.inverse_transform(arr.reshape(-1, 1)).reshape(arr.shape)
 
-        # Absolute target case
-        if not self.target_as_relative:
-            return y_arr[..., None]
+        if not diff_as_target:
+            # We already have absolute units
+            return arr[..., None]
 
-        # Relative target requires bases
+        # Diff mode → Need bases to reconstruct
         if bases is None:
-            raise ValueError(
-                "Relative target inversion requires per-sample bases. "
-                "Pass bases=out['y_train_bases'] or out['y_test_bases'] returned by build()."
-            )
-        if len(bases) != y_arr.shape[0]:
-            raise ValueError("Length of `bases` must match number of samples (S).")
+            raise ValueError("`bases` is required when diff_as_target=True.")
+        if len(bases) != arr.shape[0]:
+            raise ValueError("Length of `bases` must equal number of samples (S).")
 
-        # Step 2: reconstruct per sample; mirror forward denom
-        out_abs = np.empty_like(y_arr, dtype=float)
-        eps = self.rel_t.epsilon
-        min_den = getattr(self.rel_t, "min_denominator", 0.0)
-
-        for s in range(y_arr.shape[0]):
+        out_abs = np.empty_like(arr, dtype=float)
+        for s in range(arr.shape[0]):
             prev = bases[s]
-            for t in range(y_arr.shape[1]):
-                if min_den > 0.0:
-                    denom = np.sign(prev) * max(abs(prev), min_den)  # <-- mirror forward
-                else:
-                    denom = prev
-                out_abs[s, t] = (y_arr[s, t] * (denom + eps)) + prev
+            if not np.isfinite(prev):
+                out_abs[s, :] = np.nan  # typically only the very first sample if N=1
+                continue
+            for t in range(arr.shape[1]):
+                # x_t = prev + d_t
+                out_abs[s, t] = prev + arr[s, t]
                 prev = out_abs[s, t]
-
         return out_abs[..., None]
 
-
-
-    # ---------- static/utility methods ----------
+    # ------------------------------------------------------------------ #
+    # Static / utility methods (unchanged except comments)
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _assert_hourly_unique(dt: pd.Series | pd.Index) -> None:
         s = pd.to_datetime(dt)
@@ -250,6 +327,7 @@ class DailySequenceDataset:
 
     @staticmethod
     def _add_calendar_features(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
+        """Add standard cyclical calendar features (hour/day/month) + weekend flag."""
         out = df.copy()
         dt = pd.to_datetime(out[dt_col])
         out["hour_sin"]   = np.sin(2 * np.pi * dt.dt.hour / 24.0)
@@ -264,6 +342,9 @@ class DailySequenceDataset:
     @staticmethod
     def _choose_feature_cols(df: pd.DataFrame, target_col: str,
                              main_series: str, put_main_first: bool) -> List[str]:
+        """
+        Pick numeric columns excluding the target; optionally put `main_series` first.
+        """
         cols = [c for c in df.select_dtypes(include=np.number).columns if c != target_col]
         if main_series not in cols:
             raise ValueError(f"'{main_series}' is missing among numeric features.")
@@ -275,9 +356,11 @@ class DailySequenceDataset:
                       ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Reshape flat hourly arrays into per-day blocks.
-        Returns:
-          data_days: (num_days, 24, n_feat)
-          dt_days:   (num_days, 24) ndarray of datetimes (tz preserved)
+
+        Returns
+        -------
+        data_days: (num_days, 24, n_feat)
+        dt_days:   (num_days, 24) ndarray of datetimes (tz preserved)
         """
         n_rows = values_2d.shape[0]
         dt_arr = pd.to_datetime(dt_like).to_numpy(copy=False)
@@ -299,7 +382,7 @@ class DailySequenceDataset:
         """
         For each day d (starting at n_lookback_days-1):
           X = concat days [d - N + 1 .. d]  -> (N*24, F)
-          y = prices of day d               -> (24, 1)
+          y = target values of day d        -> (24, 1)
         """
         N = self.cfg.n_lookback_days
         num_days, _, n_feat = self.X_days.shape
@@ -341,7 +424,7 @@ class DailySequenceDataset:
         )
         return out[["datetime", target_col]]
 
-    # --------- helpers for relative inversion ---------
+    # --------- bases for diff inversion ---------
     @staticmethod
     def _compute_day_bases(y_abs: pd.Series) -> np.ndarray:
         """
@@ -355,24 +438,8 @@ class DailySequenceDataset:
             y_abs = y_abs.iloc[rem:].reset_index(drop=True)
         num_days = len(y_abs) // 24
         bases = np.full((num_days,), np.nan, dtype=float)
-        # day k starts at idx k*24; its base is idx k*24 - 1
         for k in range(num_days):
             idx = k * 24 - 1
             if idx >= 0:
                 bases[k] = float(y_abs.iloc[idx])
         return bases
-
-
-# ---------------------------------------------------------------------- #
-# Small utility: identity scaler (drop-in when scaling disabled)
-# ---------------------------------------------------------------------- #
-class _IdentityScaler:
-    def fit(self, X):
-        return self
-    def transform(self, X):
-        return np.asarray(X)
-    def fit_transform(self, X):
-        return np.asarray(X)
-    def inverse_transform(self, X):
-        return np.asarray(X)
-
